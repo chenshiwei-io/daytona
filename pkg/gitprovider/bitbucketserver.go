@@ -5,13 +5,18 @@ package gitprovider
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"strconv"
 	"strings"
 
+	"net/http"
 	"net/url"
 
+	"github.com/daytonaio/daytona/internal/util"
 	bitbucketv1 "github.com/gfleury/go-bitbucket-v1"
 	"github.com/mitchellh/mapstructure"
 )
@@ -502,4 +507,145 @@ func (g *BitbucketServerGitProvider) GetDefaultBranch(staticContext *StaticGitCo
 	}
 
 	return nil, fmt.Errorf("Default branch not found")
+}
+
+func (g *BitbucketServerGitProvider) RegisterPrebuildWebhook(repo *GitRepository, endpointUrl string) (string, error) {
+	client, err := g.getApiClient()
+	if err != nil {
+		return "", err
+	}
+
+	var hook = bitbucketv1.Webhook{
+		Events: []string{"repo:push"},
+		Active: true,
+		Url:    endpointUrl,
+	}
+
+	var requestContentType = []string{"application/json"}
+
+	// register webhook to bitbucket-server
+	resp, err := client.DefaultApi.CreateWebhook(repo.Owner, repo.Id, hook, requestContentType)
+	if err != nil {
+		return "", err
+	}
+
+	var createdHook bitbucketv1.Webhook
+	err = mapstructure.Decode(resp.Body, &createdHook)
+	if err != nil {
+		return "", fmt.Errorf("failed to decode create webhook response: %s", err.Error())
+	}
+
+	return fmt.Sprint(createdHook.ID), nil
+}
+
+func (g *BitbucketServerGitProvider) GetPrebuildWebhook(repo *GitRepository, endpointUrl string) (*string, error) {
+	client, err := g.getApiClient()
+	if err != nil {
+		return nil, err
+	}
+
+	// search webhook from bitbucket server
+	resp, err := client.DefaultApi.FindWebhooks(repo.Owner, repo.Id, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	hooks, err := bitbucketv1.GetWebhooksResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(hooks) == 0 {
+		return nil, nil
+	}
+
+	for _, hook := range hooks {
+		if hook.Url == endpointUrl {
+			return util.Pointer(fmt.Sprint(hook.ID)), nil
+		}
+	}
+
+	return nil, nil
+}
+
+func (g *BitbucketServerGitProvider) UnregisterPrebuildWebhook(repo *GitRepository, id string) error {
+	client, err := g.getApiClient()
+	if err != nil {
+		return err
+	}
+
+	// unregister webhook from bitbucket-server
+	idInt, err := strconv.Atoi(id)
+	if err != nil {
+		return err
+	}
+
+	resp, err := client.DefaultApi.DeleteWebhook(repo.Owner, repo.Id, int32(idInt))
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to delete webhook req status code: %d", resp.StatusCode)
+	}
+
+	return err
+}
+
+func (g *BitbucketServerGitProvider) GetCommitsRange(repo *GitRepository, owner string, initialSha string, currentSha string) (int, error) {
+	client, err := g.getApiClient()
+	if err != nil {
+		return 0, err
+	}
+
+	params := map[string]interface{}{"contextLines": int32(0), "from": initialSha, "to": currentSha}
+
+	resp, err := client.DefaultApi.StreamDiff_37(repo.Owner, repo.Id, "", params)
+	if err != nil {
+		return 0, err
+	}
+
+	diff, err := bitbucketv1.GetDiffResponse(resp)
+	if err != nil {
+		return 0, err
+	}
+
+	return len(diff.Diffs), nil
+}
+
+func (g *BitbucketServerGitProvider) ParseEventData(request *http.Request) (*GitEventData, error) {
+	if request.Header.Get("X-Event-Key") != "repo:push" {
+		return nil, fmt.Errorf("invalid event key")
+	}
+
+	pushEvent := bitbucketv1.WebHookRepoPush{}
+
+	payload, err := io.ReadAll(request.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	err = json.Unmarshal(payload, &pushEvent)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(pushEvent.Push.Changes) == 0 {
+		return nil, errors.New("push hook has empty changeset")
+	}
+
+	owner := pushEvent.Repository.Owner.DisplayName
+
+	gitEventData := &GitEventData{
+		Url:    util.CleanUpRepositoryUrl(pushEvent.Repository.Links.Clone[0].Href) + ".git",
+		Branch: pushEvent.Push.Changes[0].New.Name,
+		Sha:    pushEvent.Push.Changes[0].New.Target.Hash,
+		Owner:  owner,
+	}
+
+	for _, change := range pushEvent.Push.Changes {
+		gitEventData.AffectedFiles = append(gitEventData.AffectedFiles, change.New.Target.Hash)
+	}
+
+	return gitEventData, nil
 }
